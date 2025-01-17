@@ -68,16 +68,8 @@ class OFACPenaltyScraper:
             
             try:
                 for year in range(start_year, end_year + 1):
-                    # If scraping current year, remove existing entries first
-                    if year == current_year:
-                        self.remove_entries_for_year(year)
-                    
-                    # Construct the URL based on whether the year is the current year
-                    if year == current_year:
-                        url = self.base_url  # No year in the URL for the current year
-                    else:
-                        url = f"{self.base_url}/{year}-enforcement-information"
-                    
+                    # Get the number of entries on the webpage for this year
+                    url = self.base_url if year == current_year else f"{self.base_url}/{year}-enforcement-information"
                     try:
                         response = requests.get(url, headers=self.headers)
                         soup = BeautifulSoup(response.text, 'html.parser')
@@ -87,8 +79,66 @@ class OFACPenaltyScraper:
                             print(f"No table found for year {year}")
                             continue
 
-                        # Process each row
                         rows = table.find_all('tr')[1:-1]  # Skip header row and totals row
+                        web_entries = []
+                        
+                        # Extract data from web page
+                        for index, row in enumerate(rows):
+                            cells = row.find_all(['th', 'td'])
+                            if len(cells) == 4:
+                                date_cell = cells[0].find('a')
+                                if date_cell:
+                                    date_str = date_cell.text.strip().encode('ascii', 'ignore').decode('ascii').strip()
+                                    main_date_str, revision_date_str = self.extract_dates(date_str)
+                                    name = cells[1].text.strip()
+                                    penalties = self.extract_number(cells[2].text.strip())
+                                    amount = self.extract_number(cells[3].text.strip())
+                                    web_entries.append({
+                                        'date': main_date_str,
+                                        'revision_date': revision_date_str,
+                                        'name': name,
+                                        'penalties': penalties,
+                                        'amount': amount
+                                    })
+
+                        should_rescrape = False
+                        reason = None
+
+                        # Compare with database entries
+                        db_entries = self.get_entries_for_year(year)
+                        
+                        if len(web_entries) != len(db_entries):
+                            should_rescrape = True
+                            reason = f"Entry count mismatch - Web: {len(web_entries)}, DB: {len(db_entries)}"
+                        else:
+                            # Compare each entry's properties
+                            for web_entry in web_entries:
+                                matching_db_entry = next(
+                                    (db_entry for db_entry in db_entries 
+                                     if datetime.strptime(web_entry['date'], '%m/%d/%Y').date() == db_entry['date']
+                                     and web_entry['name'] == db_entry['name']),
+                                    None
+                                )
+                                
+                                if not matching_db_entry:
+                                    should_rescrape = True
+                                    reason = f"New entry found: {web_entry['name']} on {web_entry['date']}"
+                                    break
+                                
+                                if (web_entry['penalties'] != matching_db_entry['penalties'] or
+                                    web_entry['amount'] != matching_db_entry['amount']):
+                                    should_rescrape = True
+                                    reason = f"Data changed for {web_entry['name']}"
+                                    break
+
+                        if should_rescrape:
+                            print(f"Year {year}: Re-scraping needed - {reason}")
+                            self.remove_entries_for_year(year)
+                        else:
+                            print(f"Year {year}: No changes detected. Skipping...")
+                            continue
+
+                        # Process each row for scraping
                         for index, row in enumerate(rows):
                             cells = row.find_all(['th', 'td'])
                             if len(cells) == 4:
@@ -361,3 +411,45 @@ class OFACPenaltyScraper:
         except Exception as e:
             print(f"Error removing entries for year {year}: {e}")
             raise e
+
+    def get_entry_count_for_year(self, year: int) -> int:
+        """Get the number of entries in the database for a specific year."""
+        try:
+            conn = self.get_db_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT COUNT(*) FROM penalties 
+                WHERE strftime('%Y', date) = ?
+            """, (str(year),))
+            
+            count = cursor.fetchone()[0]
+            return count
+            
+        except Exception as e:
+            print(f"Error getting entry count for year {year}: {e}")
+            return 0
+
+    def get_entries_for_year(self, year: int) -> list:
+        """Get all entries from the database for a specific year."""
+        try:
+            conn = self.get_db_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT 
+                    date,
+                    revision_date,
+                    name,
+                    aggregate_penalties_settlements_findings as penalties,
+                    penalties_settlements_usd_total as amount
+                FROM penalties 
+                WHERE strftime('%Y', date) = ?
+            """, (str(year),))
+            
+            columns = [col[0] for col in cursor.description]
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+            
+        except Exception as e:
+            print(f"Error getting entries for year {year}: {e}")
+            return []

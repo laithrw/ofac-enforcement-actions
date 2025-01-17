@@ -68,6 +68,10 @@ class OFACPenaltyScraper:
             
             try:
                 for year in range(start_year, end_year + 1):
+                    # If scraping current year, remove existing entries first
+                    if year == current_year:
+                        self.remove_entries_for_year(year)
+                    
                     # Construct the URL based on whether the year is the current year
                     if year == current_year:
                         url = self.base_url  # No year in the URL for the current year
@@ -306,3 +310,54 @@ class OFACPenaltyScraper:
         main_date_str = parts[0].strip()  # The main date
         revision_date_str = parts[1].replace(')', '').strip() if len(parts) > 1 else None  # The revision date, if present
         return main_date_str, revision_date_str
+
+    def remove_entries_for_year(self, year: int):
+        """Remove all entries for a specific year from both penalties and penalties_pdfs tables."""
+        try:
+            conn = self.get_db_connection()
+            cursor = conn.cursor()
+
+            # First, get all IDs for the specified year
+            cursor.execute("""
+                SELECT id FROM penalties 
+                WHERE strftime('%Y', date) = ?
+            """, (str(year),))
+            
+            year_ids = [row[0] for row in cursor.fetchall()]
+            
+            if not year_ids:
+                return
+                
+            # Remove entries from penalties table
+            cursor.execute("""
+                DELETE FROM penalties 
+                WHERE strftime('%Y', date) = ?
+            """, (str(year),))
+            
+            # Update or remove entries from penalties_pdfs table
+            for pdf_id in year_ids:
+                cursor.execute("""
+                    UPDATE penalties_pdfs 
+                    SET linked_penalties = REPLACE(linked_penalties, ?, '')
+                    WHERE linked_penalties LIKE ?
+                """, (pdf_id + ',', '%' + pdf_id + '%'))
+                
+                # Clean up any trailing or double commas
+                cursor.execute("""
+                    UPDATE penalties_pdfs 
+                    SET linked_penalties = TRIM(REPLACE(linked_penalties, ',,', ','), ',')
+                    WHERE linked_penalties LIKE ',%' OR linked_penalties LIKE '%,'
+                """)
+                
+                # Remove PDF entries that no longer have any linked penalties
+                cursor.execute("""
+                    DELETE FROM penalties_pdfs 
+                    WHERE linked_penalties IS NULL OR linked_penalties = ''
+                """)
+            
+            conn.commit()
+            print(f"Removed existing entries for year {year}")
+            
+        except Exception as e:
+            print(f"Error removing entries for year {year}: {e}")
+            raise e
